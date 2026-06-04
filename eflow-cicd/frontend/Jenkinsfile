@@ -1,0 +1,122 @@
+pipeline {
+    agent any
+
+    environment {
+        // ── Project ──────────────────────────────
+        SONAR_PROJECT_KEY = 'eflow-frontend'
+        S3_BUCKET         = 'eflow-frontend-bucket'
+        CF_DIST_ID        = '<YOUR_CLOUDFRONT_DISTRIBUTION_ID>'
+        AWS_REGION        = 'eu-north-1'
+        BUILD_DIR         = 'dist'   // Vite → 'dist' | CRA → 'build'
+    }
+
+    tools {
+        nodejs 'NodeJS-18'
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────
+        // STAGE 1 : GitHub Checkout
+        // ─────────────────────────────────────────
+        stage('1 - GitHub Checkout') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-creds',
+                    url: 'https://github.com/peakyblinder0509/eflow-frontend'
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // STAGE 2 : Install Dependencies
+        // ─────────────────────────────────────────
+        stage('2 - Install Dependencies') {
+            steps {
+                sh 'npm install'
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // STAGE 3 : Build Frontend
+        // ─────────────────────────────────────────
+        stage('3 - Build Frontend') {
+            steps {
+                sh 'npm run build'
+                // Vite  → output: dist/
+                // CRA   → output: build/  (change BUILD_DIR above)
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // STAGE 4 : SonarQube Scan
+        // ─────────────────────────────────────────
+        stage('4 - SonarQube Scan') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        npx sonar-scanner \
+                          -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                          -Dsonar.sources=src \
+                          -Dsonar.host.url=${SONAR_HOST_URL} \
+                          -Dsonar.login=${SONAR_AUTH_TOKEN}
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // STAGE 5 : SonarQube Quality Gate
+        // ─────────────────────────────────────────
+        stage('5 - SonarQube Quality Gate') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // STAGE 6 : Deploy to AWS S3
+        // ─────────────────────────────────────────
+        stage('6 - Deploy to S3') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-creds']]) {
+                    sh """
+                        aws s3 sync ${BUILD_DIR}/ s3://${S3_BUCKET}/ \
+                          --region ${AWS_REGION} \
+                          --delete
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────
+        // STAGE 7 : CloudFront Cache Invalidation
+        // ─────────────────────────────────────────
+        stage('7 - CloudFront Invalidation') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-creds']]) {
+                    sh """
+                        aws cloudfront create-invalidation \
+                          --distribution-id ${CF_DIST_ID} \
+                          --paths "/*"
+                    """
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────
+    // POST ACTIONS
+    // ─────────────────────────────────────────
+    post {
+        success {
+            echo '✅ Frontend deployed successfully to S3 + CloudFront!'
+        }
+        failure {
+            echo '❌ Frontend pipeline failed! Check logs.'
+        }
+    }
+}
